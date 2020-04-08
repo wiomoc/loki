@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := all
-.PHONY: all images check-generated-files logcli loki loki-debug promtail promtail-debug loki-canary lint test clean yacc protos touch-protobuf-sources touch-protos
+.PHONY: all images check-generated-files logcli loki loki-debug promtail migrate promtail-debug loki-canary lint test clean yacc protos touch-protobuf-sources touch-protos
 .PHONY: helm helm-install helm-upgrade helm-publish helm-debug helm-clean
 .PHONY: docker-driver docker-driver-clean docker-driver-enable docker-driver-push
 .PHONY: fluent-bit-image, fluent-bit-push, fluent-bit-test
@@ -212,6 +212,16 @@ cmd/promtail/promtail-debug: $(APP_GO_FILES) pkg/promtail/server/ui/assets_vfsda
 	CGO_ENABLED=$(PROMTAIL_CGO) go build $(PROMTAIL_DEBUG_GO_FLAGS) -o $@ ./$(@D)
 	$(NETGO_CHECK)
 
+###############
+# Migrate #
+###############
+
+migrate: cmd/migrate/migrate
+
+cmd/migrate/migrate: $(APP_GO_FILES) cmd/migrate/main.go
+	CGO_ENABLED=0 go build $(GO_FLAGS) -o $@ ./$(@D)
+	$(NETGO_CHECK)
+
 #############
 # Releasing #
 #############
@@ -258,6 +268,7 @@ clean:
 	rm -rf dist/
 	rm -rf cmd/fluent-bit/out_loki.h
 	rm -rf cmd/fluent-bit/out_loki.so
+	rm -rf cmd/migrate/migrate
 	go clean $(MOD_FLAG) ./...
 
 #########
@@ -488,6 +499,10 @@ loki-canary-image-cross:
 	$(SUDO) $(BUILD_OCI) -t $(IMAGE_PREFIX)/loki-canary:$(IMAGE_TAG) -f cmd/loki-canary/Dockerfile.cross .
 loki-canary-push: loki-canary-image-cross
 	$(SUDO) $(PUSH_OCI) $(IMAGE_PREFIX)/loki-canary:$(IMAGE_TAG)
+
+# migrate-image
+migrate-image:
+	$(SUDO) docker build -t $(IMAGE_PREFIX)/loki-migrate:$(IMAGE_TAG) -f cmd/migrate/Dockerfile .
 
 # build-image (only amd64)
 build-image: OCI_PLATFORMS=
