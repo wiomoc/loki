@@ -21,6 +21,7 @@ import (
 	"github.com/grafana/loki/pkg/distributor"
 	"github.com/grafana/loki/pkg/ingester"
 	"github.com/grafana/loki/pkg/ingester/client"
+	"github.com/grafana/loki/pkg/oidc"
 	"github.com/grafana/loki/pkg/querier"
 	"github.com/grafana/loki/pkg/querier/queryrange"
 	"github.com/grafana/loki/pkg/storage"
@@ -31,6 +32,7 @@ import (
 type Config struct {
 	Target      moduleName `yaml:"target,omitempty"`
 	AuthEnabled bool       `yaml:"auth_enabled,omitempty"`
+	OIDCIssuer string       `yaml:"oidc_issuer"`
 	HTTPPrefix  string     `yaml:"http_prefix"`
 
 	Server           server.Config               `yaml:"server,omitempty"`
@@ -57,6 +59,7 @@ func (c *Config) RegisterFlags(f *flag.FlagSet) {
 	c.Server.ExcludeRequestInLog = true
 	f.Var(&c.Target, "target", "target module (default All)")
 	f.BoolVar(&c.AuthEnabled, "auth.enabled", true, "Set to false to disable auth.")
+	f.StringVar(&c.OIDCIssuer, "auth.oidcissuer", "", "Enables OIDC if set.")
 
 	c.Server.RegisterFlags(f)
 	c.Distributor.RegisterFlags(f)
@@ -118,7 +121,9 @@ func New(cfg Config) (*Loki, error) {
 		cfg: cfg,
 	}
 
-	loki.setupAuthMiddleware()
+	if err := loki.setupAuthMiddleware(); err != nil {
+		return nil, err
+	}
 
 	if err := loki.init(cfg.Target); err != nil {
 		return nil, err
@@ -127,27 +132,41 @@ func New(cfg Config) (*Loki, error) {
 	return loki, nil
 }
 
-func (t *Loki) setupAuthMiddleware() {
+func (t *Loki) setupAuthMiddleware() error {
 	if t.cfg.AuthEnabled {
-		t.cfg.Server.GRPCMiddleware = []grpc.UnaryServerInterceptor{
-			middleware.ServerUserHeaderInterceptor,
+		if t.cfg.OIDCIssuer != ""  {
+			t.cfg.Server.GRPCMiddleware = []grpc.UnaryServerInterceptor{
+				fakeGRPCAuthUniaryMiddleware,
+			}
+			t.cfg.Server.GRPCStreamMiddleware = []grpc.StreamServerInterceptor{
+				fakeGRPCAuthStreamMiddleware,
+			}
+			httpAuthMiddleware, err := oidc.NewOIDCHTTPAuthMiddleware(t.cfg.OIDCIssuer)
+			if err != nil {
+				return err
+			}
+			t.httpAuthMiddleware = httpAuthMiddleware
+		} else {
+			t.cfg.Server.GRPCMiddleware = []grpc.UnaryServerInterceptor{
+				middleware.ServerUserHeaderInterceptor,
+			}
+			t.cfg.Server.GRPCStreamMiddleware = []grpc.StreamServerInterceptor{
+				func(srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+					switch info.FullMethod {
+					// Don't check auth header on TransferChunks, as we weren't originally
+					// sending it and this could cause transfers to fail on update.
+					//
+					// Also don't check auth /frontend.Frontend/Process, as this handles
+					// queries for multiple users.
+					case "/logproto.Ingester/TransferChunks", "/frontend.Frontend/Process":
+						return handler(srv, ss)
+					default:
+						return middleware.StreamServerUserHeaderInterceptor(srv, ss, info, handler)
+					}
+				},
+			}
+			t.httpAuthMiddleware = middleware.AuthenticateUser
 		}
-		t.cfg.Server.GRPCStreamMiddleware = []grpc.StreamServerInterceptor{
-			func(srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
-				switch info.FullMethod {
-				// Don't check auth header on TransferChunks, as we weren't originally
-				// sending it and this could cause transfers to fail on update.
-				//
-				// Also don't check auth /frontend.Frontend/Process, as this handles
-				// queries for multiple users.
-				case "/logproto.Ingester/TransferChunks", "/frontend.Frontend/Process":
-					return handler(srv, ss)
-				default:
-					return middleware.StreamServerUserHeaderInterceptor(srv, ss, info, handler)
-				}
-			},
-		}
-		t.httpAuthMiddleware = middleware.AuthenticateUser
 	} else {
 		t.cfg.Server.GRPCMiddleware = []grpc.UnaryServerInterceptor{
 			fakeGRPCAuthUniaryMiddleware,
@@ -157,6 +176,7 @@ func (t *Loki) setupAuthMiddleware() {
 		}
 		t.httpAuthMiddleware = fakeHTTPAuthMiddleware
 	}
+	return nil
 }
 
 func (t *Loki) init(m moduleName) error {

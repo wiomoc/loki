@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-kit/kit/log/level"
@@ -160,6 +161,12 @@ func (q *Querier) Select(ctx context.Context, params logql.SelectParams) (iter.E
 		return nil, err
 	}
 
+	if aclMatcherRaw := ctx.Value("matcher"); aclMatcherRaw != nil {
+		// XXX
+		params.QueryRequest.Selector = strings.TrimRight(aclMatcherRaw.(string), "}") +
+			"," + strings.TrimLeft(params.QueryRequest.Selector, "{")
+	}
+
 	chunkStoreIter, err := q.store.LazyQuery(ctx, params)
 	if err != nil {
 		return nil, err
@@ -231,9 +238,29 @@ func (q *Querier) Label(ctx context.Context, req *logproto.LabelRequest) (*logpr
 		results = append(results, resp.response.(*logproto.LabelResponse).Values)
 	}
 	results = append(results, storeValues)
+	resultsFlat := mergeLists(results...)
+
+	if aclMatcherRaw := ctx.Value("matcher"); aclMatcherRaw != nil && req.Values {
+		aclMatchers, err := logql.ParseMatchers(aclMatcherRaw.(string))
+		if err != nil {
+			return nil, err
+		}
+		var filteredLabels []string
+
+	outer:
+		for _, label := range resultsFlat {
+			for _, matcher := range aclMatchers {
+				if matcher.Name == req.Name && !matcher.Matches(label) {
+					continue outer
+				}
+			}
+			filteredLabels = append(filteredLabels, label)
+		}
+		resultsFlat = filteredLabels
+	}
 
 	return &logproto.LabelResponse{
-		Values: mergeLists(results...),
+		Values: resultsFlat,
 	}, nil
 }
 
@@ -286,6 +313,10 @@ func (q *Querier) Tail(ctx context.Context, req *logproto.TailRequest) (*Tailer,
 	err := q.checkTailRequestLimit(ctx)
 	if err != nil {
 		return nil, err
+	}
+
+	if aclMatcherRaw := ctx.Value("matcher"); aclMatcherRaw != nil {
+		req.Query = strings.TrimRight(aclMatcherRaw.(string), "}") + "," + strings.TrimLeft(req.Query, "{")
 	}
 
 	histReq := logql.SelectParams{
